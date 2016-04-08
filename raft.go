@@ -121,10 +121,10 @@ type Raft struct {
 	logs LogStore
 
 	// Track our known peers
-	peerChangeCh chan *logFuture
-	peerCh       chan *peerFuture
-	peers        []string
-	peerStore    PeerStore
+	peerConfig peerConfigurations
+	peerCh     chan *peerFuture
+	peers      []string
+	peerStore  PeerStore
 
 	// RPC chan comes from the transport layer
 	rpcCh <-chan RPC
@@ -219,7 +219,6 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 		localAddr:     localAddr,
 		logger:        logger,
 		logs:          logs,
-		peerChangeCh:  make(chan *logFuture),
 		peerCh:        make(chan *peerFuture),
 		peers:         peers,
 		peerStore:     peerStore,
@@ -232,6 +231,7 @@ func NewRaft(conf *Config, fsm FSM, logs LogStore, stable StableStore, snaps Sna
 		verifyCh:      make(chan *verifyFuture, 64),
 		observers:     make(map[uint64]*Observer),
 	}
+	r.peerConfig.initialize()
 
 	// Initialize as a follower
 	r.setState(Follower)
@@ -372,7 +372,7 @@ func (r *Raft) AddPeer(peer string) Future {
 	}
 	logFuture.init()
 	select {
-	case r.peerChangeCh <- logFuture:
+	case r.peerConfig.changeCh <- logFuture:
 		return logFuture
 	case <-r.shutdownCh:
 		return errorFuture{ErrRaftShutdown}
@@ -391,7 +391,7 @@ func (r *Raft) RemovePeer(peer string) Future {
 	}
 	logFuture.init()
 	select {
-	case r.peerChangeCh <- logFuture:
+	case r.peerConfig.changeCh <- logFuture:
 		return logFuture
 	case <-r.shutdownCh:
 		return errorFuture{ErrRaftShutdown}
@@ -632,7 +632,7 @@ func (r *Raft) runFollower() {
 		case rpc := <-r.rpcCh:
 			r.processRPC(rpc)
 
-		case c := <-r.peerChangeCh:
+		case c := <-r.peerConfig.readCh():
 			// Reject any operations since we are not the leader
 			c.respond(ErrNotLeader)
 
@@ -722,7 +722,7 @@ func (r *Raft) runCandidate() {
 				return
 			}
 
-		case c := <-r.peerChangeCh:
+		case c := <-r.peerConfig.readCh():
 			// Reject any operations since we are not the leader
 			c.respond(ErrNotLeader)
 
@@ -912,6 +912,7 @@ func (r *Raft) leaderLoop() {
 			// Process the newly committed entries
 			commitIndex := r.leaderState.commitment.getCommitIndex()
 			r.setCommitIndex(commitIndex)
+			r.peerConfig.onCommit(commitIndex)
 			for {
 				e := r.leaderState.inflight.Front()
 				if e == nil {
@@ -949,7 +950,7 @@ func (r *Raft) leaderLoop() {
 		case p := <-r.peerCh:
 			p.respond(ErrLeader)
 
-		case log := <-r.peerChangeCh:
+		case log := <-r.peerConfig.readCh():
 			if r.preparePeerChange(log) {
 				// Apply peer set changes early and check if we will step
 				// down after the commit of this log. If so, we must not
@@ -962,6 +963,7 @@ func (r *Raft) leaderLoop() {
 					r.leaderState.commitment.setVoters(append([]string{r.localAddr}, r.peers...))
 				}
 				r.dispatchLogs([]*logFuture{log})
+				r.peerConfig.markInflight(log.log.Index)
 			}
 
 		case newLog := <-r.applyCh:
@@ -1406,6 +1408,7 @@ func (r *Raft) appendEntries(rpc RPC, a *AppendEntriesRequest) {
 		idx := min(a.LeaderCommitIndex, r.getLastIndex())
 		r.setCommitIndex(idx)
 		r.processLogs(idx, nil)
+		r.peerConfig.onCommit(idx)
 		metrics.MeasureSince([]string{"raft", "rpc", "appendEntries", "processLogs"}, start)
 	}
 
