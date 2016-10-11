@@ -94,6 +94,23 @@ type leaderState struct {
 
 	inflight      *list.List // list of logFuture in log index order
 	verifyBatches []verifyBatch
+	staging       map[ServerID]*serverStagingProgress
+}
+
+// serverStagingProgress tracks where we are in bringing a server from
+// the staging mode to a voter, we monitor a number of replication rounds
+// as discussed in section 4.2.1 of the raft dissertation
+// https://github.com/ongardie/dissertation#readme
+type serverStagingProgress struct {
+	round              serverStagingRound
+	completedRounds    int
+	promotionRequested bool
+}
+
+// serverStagingRound tracks the process of the current replication round
+type serverStagingRound struct {
+	endIndex  Index
+	startTime time.Time
 }
 
 // setLeader is used to modify the current leader of the cluster
@@ -333,6 +350,7 @@ func (r *Raft) runLeader() {
 	r.leaderState.startIndex = r.getLastIndex() + 1
 	r.leaderState.inflight = list.New()
 	r.leaderState.verifyBatches = nil
+	r.leaderState.staging = make(map[ServerID]*serverStagingProgress)
 
 	// Notify peers of leadership.
 	r.updatePeers()
@@ -579,6 +597,7 @@ func (r *Raft) leaderLoop() {
 			if ok {
 				peer.progress = progress
 				r.computeLeaderProgress()
+				r.evaluateStagingPromotion()
 			}
 
 		case <-r.shutdownCh:
@@ -715,6 +734,49 @@ func (r *Raft) computeLeaderProgress() {
 		r.updateCommitIndex(oldCommitIndex, matchIndex)
 	}
 	r.verified(verifiedCounter)
+}
+
+func (r *Raft) evaluateStagingPromotion() {
+	for _, server := range r.configurations.latest.Servers {
+		if server.Suffrage == Staging {
+			stagingProgress := r.leaderState.staging[server.ID]
+			if stagingProgress == nil {
+				stagingProgress = new(serverStagingProgress)
+				r.leaderState.staging[server.ID] = stagingProgress
+			}
+			if !stagingProgress.promotionRequested && r.updateStagingProgress(stagingProgress, r.peers[server.ID].progress.matchIndex) {
+				// promote the staging server to voter
+				stagingProgress.promotionRequested = true
+				// this evaluation is being done on the leader loop goroutine
+				// requestConfigChange can block waiting on the channel so
+				// we need to ensure we trigger our request for the promotion
+				// on a different goroutine
+				go r.requestConfigChange(configurationChangeRequest{
+					command:   Promote,
+					serverID:  server.ID,
+					prevIndex: 0,
+				}, 0)
+			}
+		}
+	}
+}
+
+// updateProgress updates the catch-up replication tracking for this
+// staging server, it returns true if we think staging is complete
+// and we can promote the server to a voter
+func (r *Raft) updateStagingProgress(p *serverStagingProgress, serverMatchIdx Index) bool {
+	if serverMatchIdx >= p.round.endIndex {
+		now := time.Now()
+		if p.round.endIndex > 0 {
+			p.completedRounds++
+			if now.Sub(p.round.startTime) < r.conf.ElectionTimeout {
+				return true
+			}
+		}
+		p.round.endIndex, _ = r.getLastLog()
+		p.round.startTime = now
+	}
+	return false
 }
 
 // Internal helper to calculate new commitIndex from matchIndexes,
